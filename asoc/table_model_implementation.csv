@@ -1,0 +1,10 @@
+model,family,implementation,main_hyperparameters,uncertainty_method
+Ridge,Linear non-graph,scikit-learn Ridge,alpha=1.0,bootstrap ensemble over training samples
+SVR-RBF,Kernel non-graph,scikit-learn SVR with MultiOutputRegressor,"kernel=RBF, C=10.0, epsilon=0.1, gamma=scale",bootstrap ensemble over training samples
+KernelRidge-RBF,Kernel non-graph,scikit-learn KernelRidge,"alpha=1.0, kernel=RBF, gamma=None/default",bootstrap ensemble over training samples
+LightGBM,Gradient-boosted tree non-graph,LightGBM LGBMRegressor with MultiOutputRegressor,"n_estimators=300, learning_rate=0.03, num_leaves=15, max_depth=4",bootstrap ensemble over training samples
+MLP,Neural non-graph,PyTorch two-hidden-layer feed-forward network,"hidden_dim=64, dropout=0.15, HuberLoss, Adam lr=0.001, weight_decay=0.0001",bootstrap ensemble over training samples
+GGNN,Graph neural network,PyTorch gated message-passing encoder + regression head,"hidden_dim=64, steps=3, dropout=0.15, HuberLoss, Adam lr=0.001",multi-seed ensemble
+GCN,Graph neural network,PyTorch mean-neighborhood graph convolution + regression head,"hidden_dim=64, dropout=0.15, HuberLoss, Adam lr=0.001",multi-seed ensemble
+GAT,Graph neural network,PyTorch single-head attention-style aggregation + regression head,"hidden_dim=64, dropout=0.15, HuberLoss, Adam lr=0.001",multi-seed ensemble
+GraphSAGE,Graph neural network,PyTorch mean-aggregation GraphSAGE-style encoder + regression head,"hidden_dim=64, dropout=0.15, HuberLoss, Adam lr=0.001",multi-seed ensemble
