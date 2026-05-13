@@ -1,28 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-run_asoc_full_all_models_uncertainty_bootstrap_v4_fair.py
-
-ASOC-ready benchmark script for AGV edge-cost prediction.
-
-Adds to the previous script:
-1. LightGBM baseline, if lightgbm is installed.
-2. Non-graph PyTorch MLP baseline.
-3. Bootstrap 95% confidence intervals and bootstrap standard deviations.
-4. ASOC-vs-ESWA difference table.
-5. Model implementation / hyperparameter table.
-6. Feature and graph-context ablation table.
-
-Expected files relative to this script:
-    outputs/edge_samples_combined.csv
-    Edge_Distances3_.csv
-
-Optional dependency:
-    pip install lightgbm
-
-Run:
-    python run_asoc_full_all_models_uncertainty_bootstrap_v4_fair.py
-"""
-
 import os
 import json
 import random
@@ -38,6 +14,13 @@ from sklearn.svm import SVR
 from sklearn.multioutput import MultiOutputRegressor
 from sklearn.kernel_ridge import KernelRidge
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+
+try:
+    from scipy.stats import wilcoxon
+    SCIPY_AVAILABLE = True
+except Exception:
+    wilcoxon = None
+    SCIPY_AVAILABLE = False
 
 try:
     from lightgbm import LGBMRegressor
@@ -938,6 +921,109 @@ def build_selective_prediction_df(detailed_df: pd.DataFrame, uncertainty_cols_ma
             )
     return pd.DataFrame(rows)
 
+def build_behavior_error_df(
+    detailed_df: pd.DataFrame,
+    pred_cols_map: Dict[str, Tuple[str, str]],
+    feature_source_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Behavior-aware error analysis for reviewer response:
+    - turning-heavy vs non-turning-heavy samples
+    - stop-heavy vs non-stop-heavy samples
+    - slowdown-heavy vs non-slowdown-heavy samples
+
+    The threshold is computed from the held-out test session using the 75th percentile.
+    """
+    rows = []
+    work = detailed_df.copy().reset_index(drop=True)
+    feat = feature_source_df.copy().reset_index(drop=True)
+
+    candidate_features = [
+        ("turn_intensity", "turning-heavy"),
+        ("stop_ratio", "stop-heavy"),
+        ("slowdown_idx", "slowdown-heavy"),
+    ]
+
+    for feature_col, label_name in candidate_features:
+        if feature_col not in feat.columns:
+            continue
+
+        values = feat[feature_col].to_numpy(dtype=float)
+        threshold = float(np.nanpercentile(values, 75))
+
+        high_mask = values >= threshold
+        low_mask = values < threshold
+
+        for model_name, (pt_col, pe_col) in pred_cols_map.items():
+            if pt_col not in work.columns or pe_col not in work.columns:
+                continue
+
+            for group_name, mask in [
+                (f"{label_name}_high_q75", high_mask),
+                (f"{label_name}_low_below_q75", low_mask),
+            ]:
+                sub = work.loc[mask].copy()
+                if len(sub) == 0:
+                    continue
+
+                row = evaluate_subset_rows(
+                    model_name,
+                    group_name,
+                    sub["target_time"].to_numpy(),
+                    sub[pt_col].to_numpy(),
+                    sub["target_energy"].to_numpy(),
+                    sub[pe_col].to_numpy(),
+                )
+                row["feature"] = feature_col
+                row["threshold_q75"] = threshold
+                rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def build_difficult_cases_df(
+    detailed_df: pd.DataFrame,
+    model_name: str = "GraphSAGE",
+    top_k: int = 10,
+) -> pd.DataFrame:
+    """
+    Extract the most difficult prediction cases for one representative model.
+    Ranking is based on the average of normalized absolute time and energy errors.
+    """
+    time_err_col = f"{model_name}_time_abs_err"
+    energy_err_col = f"{model_name}_energy_abs_err"
+
+    if time_err_col not in detailed_df.columns or energy_err_col not in detailed_df.columns:
+        return pd.DataFrame()
+
+    work = detailed_df.copy()
+
+    time_scale = max(float(work[time_err_col].median()), 1e-8)
+    energy_scale = max(float(work[energy_err_col].median()), 1e-8)
+
+    work["difficulty_score"] = 0.5 * (
+        work[time_err_col] / time_scale + work[energy_err_col] / energy_scale
+    )
+
+    cols = [
+        "session",
+        "u",
+        "v",
+        "seen_in_train",
+        "train_support_count",
+        "support_bucket",
+        "target_time",
+        f"{model_name}_time_pred",
+        time_err_col,
+        "target_energy",
+        f"{model_name}_energy_pred",
+        energy_err_col,
+        "difficulty_score",
+    ]
+
+    cols = [c for c in cols if c in work.columns]
+
+    return work.sort_values("difficulty_score", ascending=False)[cols].head(top_k)
 
 def add_ci_to_row(row: Dict[str, object], y_true_t, y_pred_t, y_true_e, y_pred_e) -> Dict[str, object]:
     row.update(bootstrap_metric_ci(y_true_t, y_pred_t, y_true_e, y_pred_e))
@@ -1337,6 +1423,7 @@ def main():
     
     print("\nTraining graph family...")
     graph_summary_rows = []
+    seedwise_rows = []
     pred_cols_map: Dict[str, Tuple[str, str]] = {}
     uncertainty_cols_map: Dict[str, Tuple[str, str]] = {}
 
@@ -1355,6 +1442,18 @@ def main():
             )
             pred = infer_graph_model(model, test_pack, node_x, edge_index, y_scaler=y_scaler)
             ensemble_preds.append(pred)
+
+                # Seed-wise metric row for mean ± std analysis across random seeds
+
+            seed_row = metrics_dict(y_true_t, pred[:, 0], y_true_e, pred[:, 1])
+
+            seed_row["model"] = model_name
+
+            seed_row["seed"] = seed
+
+            seed_row["model_family"] = "graph"
+
+            seedwise_rows.append(seed_row)
 
         ensemble_preds = np.stack(ensemble_preds, axis=0)
         pred_mean = ensemble_preds.mean(axis=0)
@@ -1379,6 +1478,48 @@ def main():
         ["time_r2", "energy_r2"], ascending=False
     ).reset_index(drop=True)
 
+    # SEED-WISE MEAN ± STD TABLE FOR GRAPH MODELS
+    seedwise_df = pd.DataFrame(seedwise_rows)
+
+    if len(seedwise_df):
+     seedwise_summary_df = (
+        seedwise_df
+        .groupby("model")
+        .agg({
+            "time_r2": ["mean", "std"],
+            "time_mae": ["mean", "std"],
+            "time_rmse": ["mean", "std"],
+            "time_mape": ["mean", "std"],
+            "energy_r2": ["mean", "std"],
+            "energy_mae": ["mean", "std"],
+            "energy_rmse": ["mean", "std"],
+            "energy_mape": ["mean", "std"],
+        })
+    )
+
+     seedwise_summary_df.columns = [
+        "_".join(col).strip() for col in seedwise_summary_df.columns.values
+     ]
+     seedwise_summary_df = seedwise_summary_df.reset_index()
+
+    # Compact manuscript-ready mean ± std format
+     seedwise_compact_df = pd.DataFrame()
+     seedwise_compact_df["model"] = seedwise_summary_df["model"]
+     seedwise_compact_df["time_r2_mean_std"] = seedwise_summary_df.apply(
+        lambda r: f"{r['time_r2_mean']:.4f} ± {r['time_r2_std']:.4f}", axis=1
+     )
+     seedwise_compact_df["time_mae_mean_std"] = seedwise_summary_df.apply(
+         lambda r: f"{r['time_mae_mean']:.3f} ± {r['time_mae_std']:.3f}", axis=1
+     )
+     seedwise_compact_df["energy_r2_mean_std"] = seedwise_summary_df.apply(
+         lambda r: f"{r['energy_r2_mean']:.4f} ± {r['energy_r2_std']:.4f}", axis=1
+     )
+     seedwise_compact_df["energy_mae_mean_std"] = seedwise_summary_df.apply(
+        lambda r: f"{r['energy_mae_mean']:.2f} ± {r['energy_mae_std']:.2f}", axis=1
+     )
+    else:
+     seedwise_summary_df = pd.DataFrame()
+     seedwise_compact_df = pd.DataFrame()
     
     # NON-GRAPH ENSEMBLES
     
@@ -1442,6 +1583,17 @@ def main():
 
     seen_unseen_df = build_seen_unseen_df(detailed_df, pred_cols_map)
     support_bucket_df = build_support_bucket_df(detailed_df, pred_cols_map)
+    behavior_error_df = build_behavior_error_df(
+        detailed_df=detailed_df,
+        pred_cols_map=pred_cols_map,
+        feature_source_df=test_raw,
+    )
+
+    difficult_cases_df = build_difficult_cases_df(
+        detailed_df=detailed_df,
+        model_name="GraphSAGE",
+        top_k=10,
+    )
 
     
     # UNCERTAINTY FOR ALL MODELS
@@ -1449,6 +1601,47 @@ def main():
     uncertainty_corr_df = build_uncertainty_corr_df(detailed_df, uncertainty_cols_map)
     selective_prediction_df = build_selective_prediction_df(detailed_df, uncertainty_cols_map)
 
+# WILCOXON SIGNIFICANCE TESTS ON ABSOLUTE ERRORS
+    wilcoxon_rows = []
+
+    if SCIPY_AVAILABLE:
+      model_pairs = [
+        ("GraphSAGE", "GGNN"),
+        ("GraphSAGE", "MLP"),
+        ("GGNN", "MLP"),
+        ("GraphSAGE", "SVR-RBF"),
+        ("GraphSAGE", "GCN"),
+        ("GraphSAGE", "GAT"),
+    ]
+
+    for m1, m2 in model_pairs:
+        if (
+            f"{m1}_time_abs_err" in detailed_df.columns
+            and f"{m2}_time_abs_err" in detailed_df.columns
+            and f"{m1}_energy_abs_err" in detailed_df.columns
+            and f"{m2}_energy_abs_err" in detailed_df.columns
+        ):
+            for target in ["time", "energy"]:
+                e1 = detailed_df[f"{m1}_{target}_abs_err"].to_numpy()
+                e2 = detailed_df[f"{m2}_{target}_abs_err"].to_numpy()
+
+                try:
+                    stat, p_value = wilcoxon(e1, e2, zero_method="wilcox", alternative="two-sided")
+                except Exception:
+                    stat, p_value = np.nan, np.nan
+
+                wilcoxon_rows.append({
+                    "comparison": f"{m1} vs {m2}",
+                    "target": target,
+                    f"{m1}_mean_abs_error": float(np.mean(e1)),
+                    f"{m2}_mean_abs_error": float(np.mean(e2)),
+                    "mean_error_difference_m1_minus_m2": float(np.mean(e1 - e2)),
+                    "wilcoxon_statistic": stat,
+                    "p_value": p_value,
+                    "significant_at_0.05": bool(p_value < 0.05) if not np.isnan(p_value) else False,
+                })
+
+    wilcoxon_df = pd.DataFrame(wilcoxon_rows)
     
     # COMBINED MAIN TABLE
     
@@ -1480,9 +1673,21 @@ def main():
     non_graph_df.to_csv(os.path.join(OUT_DIR, "table_non_graph_cross_session.csv"), index=False)
     seen_unseen_df.to_csv(os.path.join(OUT_DIR, "table_seen_unseen.csv"), index=False)
     support_bucket_df.to_csv(os.path.join(OUT_DIR, "table_support_buckets.csv"), index=False)
+    behavior_error_df.to_csv(os.path.join(OUT_DIR, "table_behavior_error_turn_stop_slowdown.csv"), index=False)
+    difficult_cases_df.to_csv(os.path.join(OUT_DIR, "table_difficult_prediction_cases_graphsage.csv"), index=False)    
     uncertainty_corr_df.to_csv(os.path.join(OUT_DIR, "table_uncertainty_corr_all_models.csv"), index=False)
     selective_prediction_df.to_csv(os.path.join(OUT_DIR, "table_selective_prediction_all_models.csv"), index=False)
     detailed_df.to_csv(os.path.join(OUT_DIR, "detailed_predictions.csv"), index=False)
+
+    # Additional ASOC statistical-rigor outputs
+
+    seedwise_df.to_csv(os.path.join(OUT_DIR, "table_seedwise_graph_model_metrics.csv"), index=False)
+
+    seedwise_summary_df.to_csv(os.path.join(OUT_DIR, "table_seedwise_graph_model_mean_std.csv"), index=False)
+
+    seedwise_compact_df.to_csv(os.path.join(OUT_DIR, "table_seedwise_graph_model_mean_std_compact.csv"), index=False)
+
+    wilcoxon_df.to_csv(os.path.join(OUT_DIR, "table_wilcoxon_significance_tests.csv"), index=False)
 
     run_config = {
         "device": DEVICE,
