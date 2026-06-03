@@ -1,6 +1,0 @@
-dimension,ASOC_benchmark_paper,ESWA_framework_paper
-Main scientific aim,Estimator-behavior benchmark under sparse cross-session AGV telemetry,Planner-compatible decision-support framework for learned edge costs
-Core contribution,"Comparison of graph and non-graph regressors with robustness, support-sensitivity and uncertainty analysis",Integration of learned edge costs with graph-search planning and temporal trajectory realization
-Models emphasized,"GGNN, GCN, GAT, GraphSAGE, Ridge, SVR-RBF, KernelRidge-RBF, LightGBM, and MLP",An inductive GNN edge-cost module embedded in a decision-support pipeline
-Evaluation level,"Cross-session edge prediction, seen/unseen edges, support buckets, uncertainty-error correlation and selective prediction","Edge-level prediction, route-level route comparison, mission-level ETA/energy and temporal rollout"
-What is intentionally excluded,"No route-planner deployment claim, no MES/OPC-UA runtime bridge, no temporal-trajectory rollout claim",Not designed as a broad estimator-family benchmark or reliability-ranking study
