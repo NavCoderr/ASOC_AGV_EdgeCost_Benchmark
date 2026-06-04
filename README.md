@@ -1,4 +1,4 @@
-# ASOC AGV Edge-Cost Benchmark
+# AGV Edge-Cost Benchmark
 
 Benchmark code and processed data for AGV edge-cost prediction using graph and non-graph estimators.
 
